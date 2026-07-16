@@ -507,6 +507,9 @@ pub(crate) async fn spawn_session_actor(
     let turn_prompt_mode = Arc::new(parking_lot::Mutex::new(PromptMode::Agent));
     let task_output_tool_name = Arc::new(std::sync::OnceLock::new());
     let read_tool_name = Arc::new(std::sync::OnceLock::new());
+    let execute_tool_name = Arc::new(std::sync::OnceLock::new());
+    let monitor_tool_name = Arc::new(std::sync::OnceLock::new());
+    let kill_task_tool_name = Arc::new(std::sync::OnceLock::new());
     let queue_exit_reminder_on_approved_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let tools_notification_handle = crate::tools::notification_bridge::spawn_notification_bridge(
         crate::tools::notification_bridge::NotificationBridgeConfig {
@@ -552,6 +555,7 @@ pub(crate) async fn spawn_session_actor(
             .and_then(|r| r.persistent_local_shell),
     );
     let browser_runtime = browser_runtime_enabled();
+    let browser_relay_host_capable = browser_runtime && workspace_ops.is_proxy();
     let terminal_backend_kind = select_terminal_backend_kind(
         startup_hints.is_subagent,
         parent_terminal_backend.is_some(),
@@ -559,6 +563,7 @@ pub(crate) async fn spawn_session_actor(
         tool_context.gateway.is_some(),
         persistent_local_shell,
         browser_runtime,
+        browser_relay_host_capable,
     );
     let terminal_backend: std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend> =
         match terminal_backend_kind {
@@ -577,6 +582,16 @@ pub(crate) async fn spawn_session_actor(
             TerminalBackendKind::LocalNonPersistent => {
                 std::sync::Arc::new(LocalTerminalBackend::new_local(resolve_search_shadows()))
             }
+            TerminalBackendKind::BrowserRelayHost => {
+                std::sync::Arc::new(BrowserRelayHostTerminalBackend::new(
+                    workspace_ops.clone(),
+                    session_info.id.0.to_string(),
+                    execute_tool_name.clone(),
+                    monitor_tool_name.clone(),
+                    task_output_tool_name.clone(),
+                    kill_task_tool_name.clone(),
+                ))
+            }
             TerminalBackendKind::BrowserUnavailable => {
                 std::sync::Arc::new(BrowserUnavailableTerminalBackend)
             }
@@ -592,6 +607,8 @@ pub(crate) async fn spawn_session_actor(
                 tool_context.gateway.clone().unwrap(),
                 tool_context.session_id.clone().unwrap(),
             ))
+        } else if browser_runtime && browser_relay_host_capable {
+            std::sync::Arc::new(BrowserRelayHostFileSystem::new(workspace_ops.clone()))
         } else if browser_runtime {
             std::sync::Arc::new(BrowserUnavailableFileSystem)
         } else {
@@ -905,11 +922,26 @@ pub(crate) async fn spawn_session_actor(
             agent.tool_bridge(),
         )
         .await;
+    let resolved_execute = agent
+        .tool_bridge()
+        .tool_for_kind(xai_grok_tools::types::tool::ToolKind::Execute)
+        .await;
+    let resolved_monitor = agent
+        .tool_bridge()
+        .tool_for_kind(xai_grok_tools::types::tool::ToolKind::Monitor)
+        .await;
+    let resolved_kill = agent
+        .tool_bridge()
+        .tool_for_kind(xai_grok_tools::types::tool::ToolKind::KillTaskAction)
+        .await;
     let resolved_read =
         xai_grok_tools::reminders::task_completion::resolve_read_tool_name(agent.tool_bridge())
             .await;
     let _ = task_output_tool_name.set(resolved_task_output.clone());
     let _ = read_tool_name.set(resolved_read);
+    let _ = execute_tool_name.set(resolved_execute);
+    let _ = monitor_tool_name.set(resolved_monitor);
+    let _ = kill_task_tool_name.set(resolved_kill);
     tool_context.task_output_tool_name = resolved_task_output.unwrap_or_else(|| {
         xai_grok_tools::reminders::task_completion::DEFAULT_TASK_OUTPUT_TOOL.to_string()
     });
@@ -2057,11 +2089,414 @@ enum TerminalBackendKind {
     AcpClient,
     LocalPersistent,
     LocalNonPersistent,
+    BrowserRelayHost,
     BrowserUnavailable,
 }
 
 const BROWSER_UNAVAILABLE_TERMINAL_ERROR: &str = "browser runtime requires a relay/client terminal backend; local process execution is unavailable";
 const BROWSER_UNAVAILABLE_FILESYSTEM_ERROR: &str = "browser runtime requires a relay/client filesystem backend; local filesystem access is unavailable";
+const DEFAULT_EXECUTE_TOOL_NAME: &str = "run_terminal_command";
+const DEFAULT_MONITOR_TOOL_NAME: &str = "monitor";
+const DEFAULT_KILL_TASK_TOOL_NAME: &str = "kill_command_or_subagent";
+
+struct BrowserRelayHostTerminalBackend {
+    workspace_ops: xai_grok_workspace::WorkspaceOps,
+    session_id: String,
+    execute_tool_name: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+    monitor_tool_name: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+    task_output_tool_name: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+    kill_task_tool_name: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+}
+
+impl BrowserRelayHostTerminalBackend {
+    fn new(
+        workspace_ops: xai_grok_workspace::WorkspaceOps,
+        session_id: String,
+        execute_tool_name: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+        monitor_tool_name: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+        task_output_tool_name: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+        kill_task_tool_name: std::sync::Arc<std::sync::OnceLock<Option<String>>>,
+    ) -> Self {
+        Self {
+            workspace_ops,
+            session_id,
+            execute_tool_name,
+            monitor_tool_name,
+            task_output_tool_name,
+            kill_task_tool_name,
+        }
+    }
+
+    fn require_proxy(&self) -> Result<(), xai_grok_tools::computer::types::ComputerError> {
+        if self.workspace_ops.is_proxy() {
+            Ok(())
+        } else {
+            Err(xai_grok_tools::computer::types::ComputerError::io(
+                BROWSER_UNAVAILABLE_TERMINAL_ERROR,
+            ))
+        }
+    }
+
+    fn tool_name(lock: &std::sync::OnceLock<Option<String>>, fallback: &str) -> String {
+        lock.get()
+            .and_then(|n| n.as_deref())
+            .unwrap_or(fallback)
+            .to_string()
+    }
+
+    fn timeout_ms(d: std::time::Duration) -> u64 {
+        d.as_millis().try_into().unwrap_or(u64::MAX)
+    }
+
+    async fn call_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        call_id: String,
+    ) -> Result<
+        xai_grok_tools::types::output::ToolRunResult,
+        xai_grok_tools::computer::types::ComputerError,
+    > {
+        self.workspace_ops
+            .call_tool(name, args, &call_id, Some(&self.session_id))
+            .await
+            .map_err(|e| xai_grok_tools::computer::types::ComputerError::io(e.to_string()))
+    }
+}
+
+#[async_trait::async_trait]
+impl xai_grok_tools::computer::types::TerminalBackend for BrowserRelayHostTerminalBackend {
+    async fn run(
+        &self,
+        request: xai_grok_tools::computer::types::TerminalRunRequest,
+    ) -> Result<
+        xai_grok_tools::computer::types::TerminalRunResult,
+        xai_grok_tools::computer::types::ComputerError,
+    > {
+        self.require_proxy()?;
+        let tool_name = match request.kind {
+            xai_grok_tools::computer::types::TaskKind::Monitor => {
+                Self::tool_name(&self.monitor_tool_name, DEFAULT_MONITOR_TOOL_NAME)
+            }
+            xai_grok_tools::computer::types::TaskKind::Bash => {
+                Self::tool_name(&self.execute_tool_name, DEFAULT_EXECUTE_TOOL_NAME)
+            }
+        };
+        let args = match request.kind {
+            xai_grok_tools::computer::types::TaskKind::Monitor => serde_json::json!({
+                "command": request.command,
+                "description": request.display_command.unwrap_or_else(|| "monitor".to_string()),
+                "timeout_ms": Self::timeout_ms(request.timeout),
+                "persistent": false
+            }),
+            xai_grok_tools::computer::types::TaskKind::Bash => serde_json::json!({
+                "command": request.command,
+                "description": "Execute command via browser relay host",
+                "timeout": Self::timeout_ms(request.timeout),
+                "is_background": false
+            }),
+        };
+        let run = self
+            .call_tool(&tool_name, args, request.tool_call_id)
+            .await?;
+        match run.output {
+            xai_grok_tools::types::output::ToolOutput::Bash(output) => {
+                Ok(xai_grok_tools::computer::types::TerminalRunResult {
+                    combined_output: String::from_utf8_lossy(&output.output).into_owned(),
+                    exit_code: Some(output.exit_code),
+                    truncated: output.truncated,
+                    signal: output.signal,
+                    timed_out: output.timed_out,
+                    output_file: std::path::PathBuf::from(output.output_file),
+                    total_bytes: output.total_bytes,
+                    pid: None,
+                })
+            }
+            other => Err(xai_grok_tools::computer::types::ComputerError::io(format!(
+                "unexpected relay output from `{tool_name}`: {}",
+                serde_json::to_string(&other).unwrap_or_else(|_| "<non-serializable>".to_string())
+            ))),
+        }
+    }
+
+    async fn run_background(
+        &self,
+        request: xai_grok_tools::computer::types::TerminalRunRequest,
+    ) -> Result<
+        xai_grok_tools::computer::types::BackgroundHandle,
+        xai_grok_tools::computer::types::ComputerError,
+    > {
+        self.require_proxy()?;
+        let tool_name = match request.kind {
+            xai_grok_tools::computer::types::TaskKind::Monitor => {
+                Self::tool_name(&self.monitor_tool_name, DEFAULT_MONITOR_TOOL_NAME)
+            }
+            xai_grok_tools::computer::types::TaskKind::Bash => {
+                Self::tool_name(&self.execute_tool_name, DEFAULT_EXECUTE_TOOL_NAME)
+            }
+        };
+        let args = match request.kind {
+            xai_grok_tools::computer::types::TaskKind::Monitor => serde_json::json!({
+                "command": request.command,
+                "description": request.display_command.unwrap_or_else(|| "monitor".to_string()),
+                "timeout_ms": Self::timeout_ms(request.timeout),
+                "persistent": false
+            }),
+            xai_grok_tools::computer::types::TaskKind::Bash => serde_json::json!({
+                "command": request.command,
+                "description": "Execute command via browser relay host",
+                "timeout": Self::timeout_ms(request.timeout),
+                "is_background": true
+            }),
+        };
+        let run = self
+            .call_tool(&tool_name, args, request.tool_call_id)
+            .await?;
+        match run.output {
+            xai_grok_tools::types::output::ToolOutput::BackgroundTaskStarted(bg) => {
+                Ok(xai_grok_tools::computer::types::BackgroundHandle {
+                    task_id: bg.task_id,
+                    output_file: std::path::PathBuf::from(bg.output_file),
+                    pid: bg.pid,
+                })
+            }
+            xai_grok_tools::types::output::ToolOutput::Monitor(output) => {
+                Ok(xai_grok_tools::computer::types::BackgroundHandle {
+                    task_id: output.task_id,
+                    output_file: request.output_file,
+                    pid: None,
+                })
+            }
+            other => Err(xai_grok_tools::computer::types::ComputerError::io(format!(
+                "unexpected relay output from `{tool_name}`: {}",
+                serde_json::to_string(&other).unwrap_or_else(|_| "<non-serializable>".to_string())
+            ))),
+        }
+    }
+
+    async fn get_task(
+        &self,
+        task_id: &str,
+    ) -> Option<xai_grok_tools::computer::types::TaskSnapshot> {
+        if self.require_proxy().is_err() {
+            return None;
+        }
+        let tool_name = Self::tool_name(
+            &self.task_output_tool_name,
+            xai_grok_tools::reminders::task_completion::DEFAULT_TASK_OUTPUT_TOOL,
+        );
+        let args = serde_json::json!({ "task_ids": [task_id], "timeout_ms": 0 });
+        let Ok(run) = self
+            .call_tool(&tool_name, args, format!("browser-get-task-{task_id}"))
+            .await
+        else {
+            return None;
+        };
+        let xai_grok_tools::types::output::ToolOutput::TaskOutput(task_output) = run.output else {
+            return None;
+        };
+        let result = match task_output {
+            xai_tool_types::TaskOutputOutput::Result(r) => Some(r),
+            xai_tool_types::TaskOutputOutput::MultiResult(mr) => {
+                mr.results.into_iter().find(|r| r.task_id == task_id)
+            }
+            xai_tool_types::TaskOutputOutput::TaskNotFound(_) => None,
+        }?;
+        let completed = matches!(result.status.as_str(), "completed" | "failed" | "cancelled");
+        let start_time = chrono::DateTime::parse_from_rfc3339(&result.started)
+            .map(|dt| dt.with_timezone(&chrono::Utc).into())
+            .unwrap_or_else(|_| std::time::SystemTime::now());
+        let end_time = result.ended.and_then(|ended| {
+            chrono::DateTime::parse_from_rfc3339(&ended)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc).into())
+        });
+        Some(xai_grok_tools::computer::types::TaskSnapshot {
+            task_id: result.task_id,
+            command: result.command,
+            display_command: None,
+            cwd: String::new(),
+            start_time,
+            end_time,
+            output: result.output,
+            output_file: std::path::PathBuf::from(result.output_file),
+            truncated: result.truncated,
+            exit_code: result.exit_code,
+            signal: None,
+            completed,
+            kind: xai_grok_tools::computer::types::TaskKind::Bash,
+            block_waited: false,
+            explicitly_killed: false,
+            owner_session_id: Some(self.session_id.clone()),
+        })
+    }
+
+    async fn kill_task(&self, task_id: &str) -> xai_grok_tools::computer::types::KillOutcome {
+        if self.require_proxy().is_err() {
+            return xai_grok_tools::computer::types::KillOutcome::NotFound;
+        }
+        let tool_name = Self::tool_name(&self.kill_task_tool_name, DEFAULT_KILL_TASK_TOOL_NAME);
+        let args = serde_json::json!({ "task_id": task_id });
+        let Ok(run) = self
+            .call_tool(&tool_name, args, format!("browser-kill-task-{task_id}"))
+            .await
+        else {
+            return xai_grok_tools::computer::types::KillOutcome::NotFound;
+        };
+        match run.output {
+            xai_grok_tools::types::output::ToolOutput::KillTask(
+                xai_tool_types::KillTaskOutput::Result(result),
+            ) => {
+                if result.outcome == "killed" {
+                    xai_grok_tools::computer::types::KillOutcome::Killed
+                } else {
+                    xai_grok_tools::computer::types::KillOutcome::AlreadyExited
+                }
+            }
+            _ => xai_grok_tools::computer::types::KillOutcome::NotFound,
+        }
+    }
+
+    async fn wait_for_completion(
+        &self,
+        task_id: &str,
+        timeout: Option<std::time::Duration>,
+    ) -> Option<xai_grok_tools::computer::types::TaskSnapshot> {
+        if self.require_proxy().is_err() {
+            return None;
+        }
+        let tool_name = Self::tool_name(
+            &self.task_output_tool_name,
+            xai_grok_tools::reminders::task_completion::DEFAULT_TASK_OUTPUT_TOOL,
+        );
+        let timeout_ms = timeout.map(Self::timeout_ms).unwrap_or(0);
+        let args = serde_json::json!({ "task_ids": [task_id], "timeout_ms": timeout_ms });
+        let _ = self
+            .call_tool(&tool_name, args, format!("browser-wait-task-{task_id}"))
+            .await
+            .ok()?;
+        self.get_task(task_id).await
+    }
+
+    async fn list_tasks(&self) -> Vec<xai_grok_tools::computer::types::TaskSnapshot> {
+        Vec::new()
+    }
+}
+
+struct BrowserRelayHostFileSystem {
+    workspace_ops: xai_grok_workspace::WorkspaceOps,
+}
+
+impl BrowserRelayHostFileSystem {
+    fn new(workspace_ops: xai_grok_workspace::WorkspaceOps) -> Self {
+        Self { workspace_ops }
+    }
+
+    fn require_proxy(&self) -> Result<(), xai_grok_tools::computer::types::ComputerError> {
+        if self.workspace_ops.is_proxy() {
+            Ok(())
+        } else {
+            Err(xai_grok_tools::computer::types::ComputerError::io(
+                BROWSER_UNAVAILABLE_FILESYSTEM_ERROR,
+            ))
+        }
+    }
+
+    async fn rpc_result(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, xai_grok_tools::computer::types::ComputerError> {
+        let raw = self
+            .workspace_ops
+            .rpc_raw(method, params)
+            .await
+            .map_err(|e| xai_grok_tools::computer::types::ComputerError::io(e.to_string()))?;
+        let env: xai_grok_workspace::rpc_envelope::RpcEnvelope<serde_json::Value> =
+            serde_json::from_value(raw).map_err(|e| {
+                xai_grok_tools::computer::types::ComputerError::io(format!(
+                    "{method}: invalid rpc envelope: {e}"
+                ))
+            })?;
+        env.into_result()
+            .map_err(xai_grok_workspace::rpc_envelope::rpc_error_to_workspace)
+            .map_err(|e| xai_grok_tools::computer::types::ComputerError::io(e.to_string()))
+    }
+}
+
+#[async_trait::async_trait]
+impl xai_grok_tools::computer::types::AsyncFileSystem for BrowserRelayHostFileSystem {
+    async fn read_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Vec<u8>, xai_grok_tools::computer::types::ComputerError> {
+        self.require_proxy()?;
+        let result = self
+            .rpc_result(
+                "workspace.fs_read_file",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "maxBytes": 1024 * 1024,
+                }),
+            )
+            .await?;
+        let content_base64 = result
+            .get("contentBase64")
+            .and_then(serde_json::Value::as_str);
+        if let Some(content_base64) = content_base64 {
+            use base64::Engine as _;
+            return base64::engine::general_purpose::STANDARD
+                .decode(content_base64)
+                .map_err(|e| xai_grok_tools::computer::types::ComputerError::io(e.to_string()));
+        }
+        let content = result
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                xai_grok_tools::computer::types::ComputerError::io(
+                    "workspace.fs_read_file missing content",
+                )
+            })?;
+        Ok(content.as_bytes().to_vec())
+    }
+
+    async fn write_file(
+        &self,
+        path: &std::path::Path,
+        data: &[u8],
+    ) -> Result<(), xai_grok_tools::computer::types::ComputerError> {
+        self.require_proxy()?;
+        let content = String::from_utf8(data.to_vec())
+            .map_err(|e| xai_grok_tools::computer::types::ComputerError::io(e.to_string()))?;
+        let _ = self
+            .rpc_result(
+                "workspace.fs_write_file",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "content": content,
+                    "createDirs": true,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(), xai_grok_tools::computer::types::ComputerError> {
+        self.require_proxy()?;
+        let _ = self
+            .rpc_result(
+                "workspace.fs_delete_file",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 struct BrowserUnavailableTerminalBackend;
@@ -2167,11 +2602,14 @@ fn select_terminal_backend_kind(
     has_gateway: bool,
     local_persistent: bool,
     browser_runtime: bool,
+    browser_relay_host_capable: bool,
 ) -> TerminalBackendKind {
     if is_subagent && has_parent_backend {
         TerminalBackendKind::ReuseParent
     } else if client_terminal_capable && has_gateway {
         TerminalBackendKind::AcpClient
+    } else if browser_runtime && browser_relay_host_capable {
+        TerminalBackendKind::BrowserRelayHost
     } else if browser_runtime {
         TerminalBackendKind::BrowserUnavailable
     } else if local_persistent {
@@ -2186,47 +2624,47 @@ mod terminal_backend_select_tests {
     #[test]
     fn subagent_with_parent_reuses_parent() {
         assert_eq!(
-            select_terminal_backend_kind(true, true, true, true, true, false),
+            select_terminal_backend_kind(true, true, true, true, true, false, false),
             TerminalBackendKind::ReuseParent
         );
     }
     #[test]
     fn subagent_without_parent_falls_through() {
         assert_eq!(
-            select_terminal_backend_kind(true, false, true, true, true, false),
+            select_terminal_backend_kind(true, false, true, true, true, false, false),
             TerminalBackendKind::AcpClient
         );
         assert_eq!(
-            select_terminal_backend_kind(true, false, false, true, true, false),
+            select_terminal_backend_kind(true, false, false, true, true, false, false),
             TerminalBackendKind::LocalPersistent
         );
     }
     #[test]
     fn non_subagent_never_reuses_parent() {
         assert_eq!(
-            select_terminal_backend_kind(false, true, false, false, true, false),
+            select_terminal_backend_kind(false, true, false, false, true, false, false),
             TerminalBackendKind::LocalPersistent
         );
     }
     #[test]
     fn client_terminal_uses_acp_only_with_gateway() {
         assert_eq!(
-            select_terminal_backend_kind(false, false, true, true, true, false),
+            select_terminal_backend_kind(false, false, true, true, true, false, false),
             TerminalBackendKind::AcpClient
         );
         assert_eq!(
-            select_terminal_backend_kind(false, false, true, false, true, false),
+            select_terminal_backend_kind(false, false, true, false, true, false, false),
             TerminalBackendKind::LocalPersistent
         );
     }
     #[test]
     fn local_session_persistent_flag_selects_backend() {
         assert_eq!(
-            select_terminal_backend_kind(false, false, false, false, true, false),
+            select_terminal_backend_kind(false, false, false, false, true, false, false),
             TerminalBackendKind::LocalPersistent
         );
         assert_eq!(
-            select_terminal_backend_kind(false, false, false, false, false, false),
+            select_terminal_backend_kind(false, false, false, false, false, false, false),
             TerminalBackendKind::LocalNonPersistent
         );
     }
@@ -2234,19 +2672,27 @@ mod terminal_backend_select_tests {
     #[test]
     fn browser_runtime_uses_browser_unavailable_without_acp_client() {
         assert_eq!(
-            select_terminal_backend_kind(false, false, false, false, true, true),
+            select_terminal_backend_kind(false, false, false, false, true, true, false),
             TerminalBackendKind::BrowserUnavailable
         );
         assert_eq!(
-            select_terminal_backend_kind(false, false, false, false, false, true),
+            select_terminal_backend_kind(false, false, false, false, false, true, false),
             TerminalBackendKind::BrowserUnavailable
+        );
+    }
+
+    #[test]
+    fn browser_runtime_uses_relay_host_when_available() {
+        assert_eq!(
+            select_terminal_backend_kind(false, false, false, false, true, true, true),
+            TerminalBackendKind::BrowserRelayHost
         );
     }
 
     #[test]
     fn browser_runtime_still_uses_acp_when_available() {
         assert_eq!(
-            select_terminal_backend_kind(false, false, true, true, true, true),
+            select_terminal_backend_kind(false, false, true, true, true, true, true),
             TerminalBackendKind::AcpClient
         );
     }
@@ -2254,7 +2700,7 @@ mod terminal_backend_select_tests {
     #[test]
     fn browser_runtime_subagent_with_parent_reuses_parent() {
         assert_eq!(
-            select_terminal_backend_kind(true, true, false, false, false, true),
+            select_terminal_backend_kind(true, true, false, false, false, true, true),
             TerminalBackendKind::ReuseParent
         );
     }
