@@ -551,12 +551,14 @@ pub(crate) async fn spawn_session_actor(
             .as_ref()
             .and_then(|r| r.persistent_local_shell),
     );
+    let browser_runtime = browser_runtime_enabled();
     let terminal_backend_kind = select_terminal_backend_kind(
         startup_hints.is_subagent,
         parent_terminal_backend.is_some(),
         client_terminal_capable,
         tool_context.gateway.is_some(),
         persistent_local_shell,
+        browser_runtime,
     );
     let terminal_backend: std::sync::Arc<dyn xai_grok_tools::computer::types::TerminalBackend> =
         match terminal_backend_kind {
@@ -575,6 +577,9 @@ pub(crate) async fn spawn_session_actor(
             TerminalBackendKind::LocalNonPersistent => {
                 std::sync::Arc::new(LocalTerminalBackend::new_local(resolve_search_shadows()))
             }
+            TerminalBackendKind::BrowserUnavailable => {
+                std::sync::Arc::new(BrowserUnavailableTerminalBackend)
+            }
         };
     if terminal_backend_kind == TerminalBackendKind::LocalPersistent {
         terminal_backend
@@ -587,6 +592,8 @@ pub(crate) async fn spawn_session_actor(
                 tool_context.gateway.clone().unwrap(),
                 tool_context.session_id.clone().unwrap(),
             ))
+        } else if browser_runtime {
+            std::sync::Arc::new(BrowserUnavailableFileSystem)
         } else {
             std::sync::Arc::new(xai_grok_tools::computer::local::LocalFs)
         };
@@ -2050,18 +2057,123 @@ enum TerminalBackendKind {
     AcpClient,
     LocalPersistent,
     LocalNonPersistent,
+    BrowserUnavailable,
 }
+
+const BROWSER_UNAVAILABLE_TERMINAL_ERROR: &str = "browser runtime requires a relay/client terminal backend; local process execution is unavailable";
+const BROWSER_UNAVAILABLE_FILESYSTEM_ERROR: &str = "browser runtime requires a relay/client filesystem backend; local filesystem access is unavailable";
+
+#[derive(Debug)]
+struct BrowserUnavailableTerminalBackend;
+
+#[async_trait::async_trait]
+impl xai_grok_tools::computer::types::TerminalBackend for BrowserUnavailableTerminalBackend {
+    async fn run(
+        &self,
+        _request: xai_grok_tools::computer::types::TerminalRunRequest,
+    ) -> Result<
+        xai_grok_tools::computer::types::TerminalRunResult,
+        xai_grok_tools::computer::types::ComputerError,
+    > {
+        Err(xai_grok_tools::computer::types::ComputerError::io(
+            BROWSER_UNAVAILABLE_TERMINAL_ERROR,
+        ))
+    }
+
+    async fn run_background(
+        &self,
+        _request: xai_grok_tools::computer::types::TerminalRunRequest,
+    ) -> Result<
+        xai_grok_tools::computer::types::BackgroundHandle,
+        xai_grok_tools::computer::types::ComputerError,
+    > {
+        Err(xai_grok_tools::computer::types::ComputerError::io(
+            BROWSER_UNAVAILABLE_TERMINAL_ERROR,
+        ))
+    }
+
+    async fn get_task(
+        &self,
+        _task_id: &str,
+    ) -> Option<xai_grok_tools::computer::types::TaskSnapshot> {
+        None
+    }
+
+    async fn kill_task(&self, _task_id: &str) -> xai_grok_tools::computer::types::KillOutcome {
+        xai_grok_tools::computer::types::KillOutcome::NotFound
+    }
+
+    async fn wait_for_completion(
+        &self,
+        _task_id: &str,
+        _timeout: Option<std::time::Duration>,
+    ) -> Option<xai_grok_tools::computer::types::TaskSnapshot> {
+        None
+    }
+
+    async fn list_tasks(&self) -> Vec<xai_grok_tools::computer::types::TaskSnapshot> {
+        Vec::new()
+    }
+}
+
+#[derive(Debug)]
+struct BrowserUnavailableFileSystem;
+
+#[async_trait::async_trait]
+impl xai_grok_tools::computer::types::AsyncFileSystem for BrowserUnavailableFileSystem {
+    async fn read_file(
+        &self,
+        _path: &std::path::Path,
+    ) -> Result<Vec<u8>, xai_grok_tools::computer::types::ComputerError> {
+        Err(xai_grok_tools::computer::types::ComputerError::io(
+            BROWSER_UNAVAILABLE_FILESYSTEM_ERROR,
+        ))
+    }
+
+    async fn write_file(
+        &self,
+        _path: &std::path::Path,
+        _data: &[u8],
+    ) -> Result<(), xai_grok_tools::computer::types::ComputerError> {
+        Err(xai_grok_tools::computer::types::ComputerError::io(
+            BROWSER_UNAVAILABLE_FILESYSTEM_ERROR,
+        ))
+    }
+
+    async fn delete_file(
+        &self,
+        _path: &std::path::Path,
+    ) -> Result<(), xai_grok_tools::computer::types::ComputerError> {
+        Err(xai_grok_tools::computer::types::ComputerError::io(
+            BROWSER_UNAVAILABLE_FILESYSTEM_ERROR,
+        ))
+    }
+}
+
+fn browser_runtime_enabled() -> bool {
+    if cfg!(target_arch = "wasm32") {
+        return true;
+    }
+    crate::agent::config::BoolFlag::env("GROK_BROWSER_RUNTIME")
+        .default(false)
+        .resolve()
+        .value
+}
+
 fn select_terminal_backend_kind(
     is_subagent: bool,
     has_parent_backend: bool,
     client_terminal_capable: bool,
     has_gateway: bool,
     local_persistent: bool,
+    browser_runtime: bool,
 ) -> TerminalBackendKind {
     if is_subagent && has_parent_backend {
         TerminalBackendKind::ReuseParent
     } else if client_terminal_capable && has_gateway {
         TerminalBackendKind::AcpClient
+    } else if browser_runtime {
+        TerminalBackendKind::BrowserUnavailable
     } else if local_persistent {
         TerminalBackendKind::LocalPersistent
     } else {
@@ -2074,48 +2186,76 @@ mod terminal_backend_select_tests {
     #[test]
     fn subagent_with_parent_reuses_parent() {
         assert_eq!(
-            select_terminal_backend_kind(true, true, true, true, true),
+            select_terminal_backend_kind(true, true, true, true, true, false),
             TerminalBackendKind::ReuseParent
         );
     }
     #[test]
     fn subagent_without_parent_falls_through() {
         assert_eq!(
-            select_terminal_backend_kind(true, false, true, true, true),
+            select_terminal_backend_kind(true, false, true, true, true, false),
             TerminalBackendKind::AcpClient
         );
         assert_eq!(
-            select_terminal_backend_kind(true, false, false, true, true),
+            select_terminal_backend_kind(true, false, false, true, true, false),
             TerminalBackendKind::LocalPersistent
         );
     }
     #[test]
     fn non_subagent_never_reuses_parent() {
         assert_eq!(
-            select_terminal_backend_kind(false, true, false, false, true),
+            select_terminal_backend_kind(false, true, false, false, true, false),
             TerminalBackendKind::LocalPersistent
         );
     }
     #[test]
     fn client_terminal_uses_acp_only_with_gateway() {
         assert_eq!(
-            select_terminal_backend_kind(false, false, true, true, true),
+            select_terminal_backend_kind(false, false, true, true, true, false),
             TerminalBackendKind::AcpClient
         );
         assert_eq!(
-            select_terminal_backend_kind(false, false, true, false, true),
+            select_terminal_backend_kind(false, false, true, false, true, false),
             TerminalBackendKind::LocalPersistent
         );
     }
     #[test]
     fn local_session_persistent_flag_selects_backend() {
         assert_eq!(
-            select_terminal_backend_kind(false, false, false, false, true),
+            select_terminal_backend_kind(false, false, false, false, true, false),
             TerminalBackendKind::LocalPersistent
         );
         assert_eq!(
-            select_terminal_backend_kind(false, false, false, false, false),
+            select_terminal_backend_kind(false, false, false, false, false, false),
             TerminalBackendKind::LocalNonPersistent
+        );
+    }
+
+    #[test]
+    fn browser_runtime_uses_browser_unavailable_without_acp_client() {
+        assert_eq!(
+            select_terminal_backend_kind(false, false, false, false, true, true),
+            TerminalBackendKind::BrowserUnavailable
+        );
+        assert_eq!(
+            select_terminal_backend_kind(false, false, false, false, false, true),
+            TerminalBackendKind::BrowserUnavailable
+        );
+    }
+
+    #[test]
+    fn browser_runtime_still_uses_acp_when_available() {
+        assert_eq!(
+            select_terminal_backend_kind(false, false, true, true, true, true),
+            TerminalBackendKind::AcpClient
+        );
+    }
+
+    #[test]
+    fn browser_runtime_subagent_with_parent_reuses_parent() {
+        assert_eq!(
+            select_terminal_backend_kind(true, true, false, false, false, true),
+            TerminalBackendKind::ReuseParent
         );
     }
 }
